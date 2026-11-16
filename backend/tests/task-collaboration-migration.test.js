@@ -1,0 +1,13 @@
+const {test}=require('node:test')
+const assert=require('node:assert/strict'),fs=require('fs'),path=require('path')
+const sql=fs.readFileSync(path.join(__dirname,'../scripts/migrations/0154-task-comments-activity.sql'),'utf8')
+test('0154 is a transactional storage-only migration without existing-object or authorization changes',()=>{
+ assert.match(sql,/BEGIN;/);assert.match(sql,/COMMIT;\s*$/)
+ assert.match(sql,/SET LOCAL lock_timeout = '5000ms'/);assert.match(sql,/SET LOCAL statement_timeout = '30000ms'/)
+ const statements=sql.replace(/--[^\n]*/g,'')
+ assert.doesNotMatch(statements,/\b(ALTER|DROP|TRIGGER|FUNCTION|GRANT|REVOKE|POLICY|UPDATE|DELETE|INSERT)\b(?!\s+(?:CASCADE|SET NULL))/i)
+ assert.deepEqual([...statements.matchAll(/CREATE TABLE (\w+)/g)].map(m=>m[1]),['project_task_comments','project_task_activity'])
+ assert.doesNotMatch(statements,/\bproject_id\b|IF NOT EXISTS/)
+ assert.equal((statements.match(/ON DELETE CASCADE/g)||[]).length,2)
+ assert.equal((statements.match(/ON DELETE SET NULL/g)||[]).length,2)
+})

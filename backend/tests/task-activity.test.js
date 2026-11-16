@@ -1,0 +1,37 @@
+require('./helpers/offline')
+const {test}=require('node:test'),assert=require('node:assert/strict'),crypto=require('crypto'),fs=require('fs'),path=require('path'),request=require('supertest')
+const v=require('../src/services/taskActivityValidation'),{createApp}=require('../src/app'),{createTestRepository}=require('./helpers/users'),{signToken}=require('../src/middleware/auth')
+const id=()=>crypto.randomUUID()
+function event(taskId){return {id:'9007199254740993',taskId,actor:null,eventType:'status_changed',origin:'database',reason:'unknown',changes:{version:1,from:'To Do',to:'Done'},occurredAt:'2026-10-16T13:00:00.000Z',correlationId:null}}
+test('activity migration contains exactly one task producer and no backfill or access changes',()=>{
+ const sql=fs.readFileSync(path.join(__dirname,'../scripts/migrations/0155-task-activity-producer.sql'),'utf8')
+ assert.match(sql,/BEGIN;/);assert.match(sql,/COMMIT;\s*$/);assert.equal((sql.match(/INSERT INTO %I\.project_task_activity/g)||[]).length,1)
+ assert.equal((sql.match(/CREATE TRIGGER/g)||[]).length,1);assert.match(sql,/AFTER INSERT OR UPDATE ON project_tasks/)
+ assert.equal((sql.match(/CREATE OR REPLACE FUNCTION devnexus_task_assignment_/g)||[]).length,2)
+ assert.doesNotMatch(sql,/\b(GRANT|REVOKE|DROP TABLE|ALTER TABLE)\b/);assert.match(sql,/txid_current/);assert.match(sql,/SECURITY INVOKER/)
+})
+test('activity cursors reject comment streams, foreign tasks, invalid limits, versions and BIGINT overflow',()=>{
+ const task=id();assert.deepEqual(v.pagination(task,{}),{limit:20,before:null});assert.deepEqual(v.pagination(task,{limit:'50',before:v.cursor(task,'9007199254740993')}),{limit:50,before:'9007199254740993'})
+ for(const before of ['bad','',v.cursor(id(),'1'),v.cursor(task,'0'),v.cursor(task,'9223372036854775808'),Buffer.from(JSON.stringify({v:1,taskId:task,stream:'comments',before:'1'})).toString('base64url'),Buffer.from(JSON.stringify({v:2,taskId:task,stream:'activity',before:'1'})).toString('base64url')])assert.throws(()=>v.pagination(task,{before}),e=>e.code==='invalid_request')
+ for(const limit of ['0','51','01',[],true,'1.5'])assert.throws(()=>v.pagination(task,{limit}))
+})
+test('activity canonical validation fails closed for identity, enum, payload, order and leaked fields',()=>{
+ const task=id(),valid=event(task);assert.deepEqual(v.record(valid,task),valid)
+ for(const change of [{taskId:id()},{id:42},{actor:{userId:null,displayName:'  '}},{reason:'membership_removed'},{origin:'browser'},{changes:{version:1,from:'To Do',to:'To Do'}},{changes:{version:2,from:'To Do',to:'Done'}},{changes:{version:1,from:'To Do',to:'Done',extra:1}},{password:'secret'},{occurredAt:'invalid'}])assert.throws(()=>v.record({...valid,...change},task))
+ assert.throws(()=>v.page({taskId:task,activity:[valid,valid],limit:2,hasMore:false,nextCursor:null},task,2))
+ assert.throws(()=>v.page({taskId:task,activity:[valid],limit:1,hasMore:true,nextCursor:'wrong'},task,1))
+})
+test('mocked activity API uses registered authentication, no-store, canonical shape and sanitized failures',async()=>{
+ const users=createTestRepository(),owner={id:id(),email:'owner@activity.test',role:'Developer'};await users.createUser(owner);const task=id(),item=event(task)
+ const repository={async list(){return {taskId:task,activity:[item],limit:20,hasMore:false,nextCursor:null}}}
+ const app=createApp({userRepository:users,taskActivityRepository:repository}),url='/api/project-tasks/'+task+'/activity',token=signToken(owner)
+ assert.equal((await request(app).get(url)).status,401)
+ let r=await request(app).get(url).set('Authorization','Bearer '+token);assert.equal(r.status,200);assert.equal(r.headers['cache-control'],'no-store');assert.deepEqual(r.body.activity,[item])
+ assert.equal((await request(app).get(url+'?limit=51').set('Authorization','Bearer '+token)).status,400)
+ const malformed=await request(app).get(url).set('Authorization','Bearer '+token).set('Content-Type','application/json').send('{"private-activity-sentinel": invalid}')
+ assert.equal(malformed.status,400);assert.equal(malformed.headers['cache-control'],'no-store');assert.doesNotMatch(JSON.stringify(malformed.body),/private-activity-sentinel|SyntaxError/)
+ assert.equal((await request(app).post(url).set('Authorization','Bearer '+token).send({eventType:'forged'})).status,404)
+ repository.list=async()=>{throw v.error('not_found','Owned task not found.',404)};assert.equal((await request(app).get(url).set('Authorization','Bearer '+token)).status,404)
+ repository.list=async()=>{throw Error('private SQL password')};r=await request(app).get(url).set('Authorization','Bearer '+token);assert.equal(r.status,503);assert.doesNotMatch(JSON.stringify(r.body),/private|password|SQL/)
+ repository.list=async()=>({taskId:task,activity:[{...item,taskId:id()}],limit:20,hasMore:false,nextCursor:null});assert.equal((await request(app).get(url).set('Authorization','Bearer '+token)).status,503)
+})

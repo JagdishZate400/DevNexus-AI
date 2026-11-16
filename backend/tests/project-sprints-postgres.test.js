@@ -1,0 +1,65 @@
+require('./helpers/offline')
+const {test}=require('node:test')
+const assert=require('node:assert/strict')
+const crypto=require('crypto')
+const fs=require('fs')
+const path=require('path')
+const {Pool}=require('pg')
+const {createSprintRepository}=require('../src/db/sprintRepository')
+const {createTaskRepository}=require('../src/db/taskRepository')
+// Explicit disposable test database only. Never uses the development DATABASE_URL.
+test('PostgreSQL sprint persistence, task status aggregates, isolation and SQL constraints',{skip:!process.env.SPRINT_TEST_DATABASE_URL},async()=>{
+ const connectionString=process.env.SPRINT_TEST_DATABASE_URL,schema='sprint_test_'+crypto.randomBytes(8).toString('hex')
+ const admin=new Pool({connectionString,connectionTimeoutMillis:5000});let pool,restarted
+ try{
+  await admin.query(`CREATE SCHEMA ${schema}`)
+  const options={connectionString,options:`-c search_path=${schema}`,connectionTimeoutMillis:5000}
+  pool=new Pool(options);await pool.query('CREATE TABLE users(id UUID PRIMARY KEY,full_name TEXT,email TEXT)')
+  for(const file of ['0132-source-workspace.sql','0146-project-tasks.sql'])await pool.query(fs.readFileSync(path.join(__dirname,'../scripts/migrations',file),'utf8'))
+  const owner=crypto.randomUUID(),other=crypto.randomUUID()
+  await pool.query('INSERT INTO users(id) VALUES($1),($2)',[owner,other])
+  await pool.query('INSERT INTO source_projects(id,owner_id,name) VALUES($1,$2,$3),($4,$2,$5),($6,$7,$8)',['owned',owner,'Owned','second','Second','foreign',other,'Foreign'])
+  let tasks=createTaskRepository(pool)
+  const task={id:crypto.randomUUID()}
+  await pool.query("INSERT INTO project_tasks(id,project_id,creator_id,title) VALUES($1,'owned',$2,'Existing task')",[task.id,owner])
+  await pool.query(fs.readFileSync(path.join(__dirname,'../scripts/migrations/0147-project-sprints.sql'),'utf8'))
+  await pool.query(fs.readFileSync(path.join(__dirname,'../scripts/migrations/0152-task-assignment.sql'),'utf8'))
+  assert.equal((await tasks.read(task.id,owner)).title,'Existing task')
+  let repo=createSprintRepository(pool)
+  const input={projectId:'owned',name:'Release',startDate:'2026-10-15',endDate:'2026-10-16'}
+  const sprint=await repo.create(input,owner),second=await repo.create({...input,projectId:'second'},owner)
+  assert.equal(sprint.progress,null)
+  await repo.assign(sprint.id,task.id,owner);await repo.assign(sprint.id,task.id,owner)
+  assert.equal((await repo.read(sprint.id,owner)).counts.total,1)
+  await tasks.update(task.id,owner,{status:'Done'})
+  assert.equal((await repo.read(sprint.id,owner)).progress,100)
+  const pending=await tasks.create({projectId:'owned',title:'Pending task'},owner)
+  await repo.assign(sprint.id,pending.id,owner)
+  assert.equal((await repo.update(sprint.id,owner,{status:'Completed'})).progress,50)
+  assert.equal((await tasks.read(pending.id,owner)).status,'To Do')
+  for(const run of [()=>repo.read(sprint.id,other),()=>repo.assign(sprint.id,pending.id,other),()=>repo.tasks(sprint.id,other,{}),()=>repo.update(sprint.id,other,{status:'Active'}),()=>repo.list(other,{projectId:'owned'})])await assert.rejects(run(),e=>e.code==='not_found')
+  const client=await pool.connect()
+  async function fails(sql,args,code){await client.query('BEGIN');try{await assert.rejects(client.query(sql,args),e=>e.code===code)}finally{await client.query('ROLLBACK')}}
+  try{
+   await fails('UPDATE project_tasks SET sprint_id=$2 WHERE id=$1',[task.id,second.id],'23503')
+   await fails('UPDATE project_tasks SET sprint_id=$2 WHERE id=$1',[task.id,crypto.randomUUID()],'23503')
+   await fails("UPDATE project_sprints SET end_date='2026-10-14' WHERE id=$1",[sprint.id],'23514')
+   await fails("UPDATE project_sprints SET status='Done' WHERE id=$1",[sprint.id],'23514')
+  }finally{client.release()}
+  await pool.end();pool=null;restarted=new Pool(options);repo=createSprintRepository(restarted)
+  const saved=await repo.read(sprint.id,owner);assert.equal(saved.status,'Completed');assert.equal(saved.progress,50)
+  assert.equal((await repo.tasks(sprint.id,owner,{limit:'1',offset:'1'})).tasks.length,1)
+  assert.equal((await repo.tasks(sprint.id,owner,{limit:'1'})).total,2)
+  const next=await repo.create(input,owner)
+  await assert.rejects(repo.assign(next.id,task.id,owner),e=>e.code==='task_already_assigned')
+  await repo.assign(sprint.id,task.id,owner,true);await repo.assign(next.id,task.id,owner)
+  assert.equal((await repo.read(next.id,owner)).progress,100)
+  const concurrentTask=await createTaskRepository(restarted).create({projectId:'owned',title:'Concurrent assignment'},owner)
+  const races=await Promise.allSettled([repo.assign(sprint.id,concurrentTask.id,owner),repo.assign(next.id,concurrentTask.id,owner)])
+  assert.equal(races.filter(result=>result.status==='fulfilled').length,1)
+  assert.equal(races.find(result=>result.status==='rejected').reason.code,'task_already_assigned')
+ }finally{
+  if(pool)await pool.end();if(restarted)await restarted.end()
+  await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);await admin.end()
+ }
+})
